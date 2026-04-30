@@ -1,6 +1,7 @@
-import os
 import re
+import os
 import time
+from typing import Optional, Tuple, Dict, Any
 from io import BytesIO
 from urllib.parse import urljoin
 
@@ -11,173 +12,582 @@ from googlesearch import search
 import os
 from openai import AzureOpenAI
 import pandas as pd
-from openai import AzureOpenAI
 from openai import OpenAI
+from anthropic import AnthropicFoundry
 
-def pattern_match(text,p1="<answer>",p2="</answer>"):
-    start_marker = p1
-    end_marker = p2
+#run_diagnosis
+#run_generank
 
-    start_index = text.find(start_marker)
-    end_index = text.find(end_marker)
-    try:
-        if start_index != -1 and end_index != -1:
-            # Adjust start_index to begin *after* the start_marker
-            extracted_text = text[start_index + len(start_marker) : end_index]
-    except:
-        extracted_text = 'nan'
-    return extracted_text
+import pandas as pd
+from openai import OpenAI
+from anthropic import AnthropicFoundry
+from tqdm import tqdm
+
+# ─────────────────────────────────────────────
+# Azure AI Foundry credentials for Claude
+# ─────────────────────────────────────────────
+AZURE_BASE_URL = ""
+AZURE_API_KEY = ""
 
 
-def run_diagnosis(input_patient_information, knowinte=True, knowgene=None, geneinfo=None):
-    matched_pheno_dict = pd.read_pickle("/home/tl688/pitl688/rarebenchdata/rarebench_onlypheno_new.pkl")
-    """
-    Run diagnosis based on the multiple agent system.
+# ─────────────────────────────────────────────
+# Utility helpers
+# ─────────────────────────────────────────────
 
-    Parameters:
-    -----------
-    input_patient_information : str
-        The information of this patient.
+def _safe_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and pd.isna(x):
+        return ""
+    return str(x).strip()
 
-    Returns:
-    --------
-    str
-        Diagnosis result
-    """
-    epoch = 5
-    endpoint = os.environ["endpoint"]
-    base_url = os.environ["base_url"]
 
-    model = "gpt-5-chat-3"
+def _extract_tag(text: str, tag: str) -> str:
+    """Extract content inside XML-like tags, e.g. <solution>...</solution>."""
+    if not text:
+        return ""
+    pattern = rf"<{tag}>\s*(.*?)\s*</{tag}>"
+    match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
 
-    subscription_key = os.environ["subscription_key"]
-    api_version = "2025-03-01-preview"
 
-    client = AzureOpenAI(
-        api_version=api_version,
-        azure_endpoint=endpoint,
-        api_key=subscription_key,
+def _normalize_yes_no(text: str) -> str:
+    answer = _extract_tag(text, "solution") or _extract_tag(text, "answer") or text
+    answer = answer.upper()
+    if "YES" in answer:
+        return "YES"
+    return "NO"
+
+
+# ─────────────────────────────────────────────
+# Prompt builders  (improved over GPT version)
+# ─────────────────────────────────────────────
+
+def _make_diagnosis_prompt(
+    input_patient_information: str,
+    prior_knowledge: str,
+    disease_num: str,
+) -> str:
+    context_section = (
+        f"\n\n## Supporting Literature / Context\n{prior_knowledge}"
+        if prior_knowledge.strip()
+        else ""
     )
-    client_verifier = OpenAI(
-    base_url=base_url,
-    api_key=subscription_key)
-    prior_knowledge = ""
-    if knowinte:
-        pheno_list = input_patient_information.split(", ")
-        for key in pheno_list:
-            key = key.replace(".","")
-            prior_knowledge += f"{key}:{matched_pheno_dict[key]}"
-    if knowgene != None:
-        prior_knowledge += "Risk Gene Information: The detected risk gene is: " + knowgene +"."
-    if geneinfo!=None and geneinfo!='nan':
-        prior_knowledge += "The function of this gene is: "+geneinfo
-        
-    disease_num = "one"
-    meta_prompt = f"You are a knowledgeable biologist and physician who has been provided with the following context information: {prior_knowledge}. The input phenotypes are: {input_patient_information}. Based on this input, your task is to carefully analyze the details and produce a diagnosis by identifying the top {disease_num} most relevant disease names. These disease names should be standardized according to the conventions used in OMIM, Orphanet, and CCRD. In completing this task, you should integrate the given context thoughtfully, document your reasoning process within <thinking></thinking>, and present the final list of the top {disease_num} disease names within <solution></solution>."
-    response = client.responses.create(
-        model=model,
-        input=meta_prompt,
-        temperature=0.1
+    return f"""You are an expert clinical geneticist and rare disease specialist with deep knowledge of OMIM, Orphanet, and CCRD disease classifications.
+
+## Patient Phenotypes
+{input_patient_information}
+{context_section}
+
+## Task
+Systematically analyze these phenotypes and identify the top {disease_num} most likely rare disease diagnosis(es).
+
+Follow this structured approach:
+1. **Phenotype grouping** – Cluster phenotypes by organ system; flag the most distinctive or pathognomonic features.
+2. **Pattern recognition** – Infer likely inheritance mode, age of onset, and disease trajectory.
+3. **Differential diagnosis** – List candidate diseases ranked by how well they explain *all* phenotypes; briefly note key supporting and contradicting evidence for each.
+4. **Final selection** – Choose the most parsimonious diagnosis that covers the broadest phenotype set.
+
+Formatting requirements:
+- Disease names must follow the official OMIM / Orphanet / CCRD nomenclature (not synonyms or abbreviations).
+- Prefer specific disease names over broad category labels.
+
+Document your full reasoning within <thinking></thinking>.
+List the final top {disease_num} disease name(s) within <solution></solution>, one per line, no numbers or bullets."""
+
+
+def _make_verifier_prompt(
+    prior_knowledge: str,
+    input_patient_information: str,
+    diagnosis_text: str,
+) -> str:
+    context_section = (
+        f"\n## Supporting Context\n{prior_knowledge}"
+        if prior_knowledge.strip()
+        else ""
     )
-    modelout = response.output_text
-#     modelout = 'nan'
+    return f"""You are an expert clinical geneticist critically reviewing a rare disease diagnosis.
+
+## Patient Phenotypes
+{input_patient_information}
+{context_section}
+
+## Diagnosis Under Review
+{diagnosis_text}
+
+## Your Evaluation Criteria
+1. Does the proposed disease explain **all** listed phenotypes?
+2. Are there phenotypes that contradict the proposed diagnosis?
+3. Is a more specific or more likely disease possible given this phenotype combination?
+4. Is the disease name correctly formatted per OMIM/Orphanet conventions?
+
+Document your critical reasoning within <thinking></thinking>.
+- If the diagnosis is well-supported: output YES within <solution></solution>.
+- If the diagnosis needs improvement: output NO within <solution></solution> AND provide 1-3 specific alternative diseases to consider within <feedback></feedback>, with a brief rationale for each."""
+
+
+def _make_retry_prompt(
+    input_patient_information: str,
+    prior_knowledge: str,
+    previous_diagnosis: str,
+    verifier_feedback: str,
+    disease_num: str,
+) -> str:
+    context_section = (
+        f"\n\n## Supporting Literature / Context\n{prior_knowledge}"
+        if prior_knowledge.strip()
+        else ""
+    )
+    return f"""You are an expert clinical geneticist. Your previous diagnosis was reviewed by a specialist and found to need revision.
+
+## Patient Phenotypes
+{input_patient_information}
+{context_section}
+
+## Previous Diagnosis (rejected)
+{previous_diagnosis}
+
+## Reviewer Feedback
+{verifier_feedback}
+
+## Instructions
+Incorporate the reviewer's feedback and produce a revised diagnosis.
+Focus especially on:
+- Phenotypes that were unexplained or contradicted by the previous answer
+- The specific alternative diseases the reviewer mentioned
+- Using the most precise OMIM/Orphanet disease name
+
+Document your revised reasoning within <thinking></thinking>.
+List the revised top {disease_num} disease name(s) within <solution></solution>, one per line."""
+
+
+def _call_claude(
+    client,
+    model_name,
+    prompt,
+    max_tokens: int = 4096,
+) -> str:
+    """Call Claude via Azure AI Foundry and return the text response."""
+    verify_kwargs = {
+        "model": model_name,
+        "input": prompt,
+    }
+    verify_response = client.responses.create(**verify_kwargs)
+    verifier_text = verify_response.output_text
+    return verifier_text
+
+def run_diagnosis(
+    input_patient_information: str,
+    knowinte = True,
+    knowgene = None,
+    disease_num: str = "one",
+    model: str = "gpt-5.4-mini",
+    verifier_model: str = "gpt-5.4-mini",
+    max_verify_rounds: int = 3,
+) -> Tuple[str, str]:
+    """
+    Rare disease diagnosis via Claude on Azure AI Foundry + iterative self-verification.
+
+    Improvements over the GPT-based version
+    ----------------------------------------
+    * Separate verifier call reduces shared bias (different prompt framing).
+    * Verifier returns structured <feedback> with specific alternative diagnoses.
+    * Retry prompt feeds that feedback back, giving targeted guidance rather than a generic retry.
+    * prior_knowledge (pre-retrieved literature context) is integrated into every prompt.
+
+    Returns
+    -------
+    (model_output, prior_knowledge)
+    """
+    if not _safe_str(input_patient_information):
+        raise ValueError("input_patient_information must be a non-empty string.")
+
+    client = OpenAI(
+        base_url=AZURE_BASE_URL,
+        api_key=AZURE_API_KEY
+    )
     
-    verifier_prompt = '''You are a helpful biologist and physician tasked with extracting and parsing the task output from an agent’s message history. Review the entire message history and verify the diagnostic process and final result against the provided context. The context information is {CONTEXT}, and the diagnosis process and conclusion are {OUTPUT}. Carefully integrate the context, think through the evidence, and produce a binary judgment: output YES if the diagnosis is correct, or NO if it is incorrect. Document your reasoning within <think></think>, and present your final judgment within <answer></answer>.'''
-    for _ in range(epoch):
-        print(f"starting self-verification: epoch {_}")
-        try:
-            response = client.responses.create(
-                model=model,
-                input=verifier_prompt.format(CONTEXT=prior_knowledge, OUTPUT=pattern_match(modelout, "<solution>", "</solution>")),
-                temperature=0.1
-            )
-            modelout_verifier = response.output_text
-    #         print(modelout_verifier)
-            modelout_verifier = pattern_match(modelout_verifier)
-        except:
-            modelout_verifier = "NO"
-        if "YES" in modelout_verifier:
-            break
-        else:
-            response = client_verifier.responses.create(
-                model=model,
-                input=f"The previous diagnosis process: {modelout}, is wrong. Make new diagnosis again with thinking and searching."+meta_prompt,
-                temperature=0.1
-            )
-            modelout = response.output_text
-    time.sleep(5)
-    return modelout
-    
-def run_generank(input_patient_information, knowinte=True, knowdisease=None):
-    """
-    Run diagnosis based on the multiple agent system.
-
-    Parameters:
-    -----------
-    input_patient_information : str
-        The information of this patient.
-
-    Returns:
-    --------
-    str
-        Diagnosis result
-    """
-    epoch = 5
-    endpoint = os.environ["endpoint"]
-    base_url = os.environ["base_url"]
-
-    model = "gpt-5-chat-3"
-
-    subscription_key = os.environ["subscription_key"]
-    api_version = "2025-03-01-preview"
-
-    client = AzureOpenAI(
-        api_version=api_version,
-        azure_endpoint=endpoint,
-        api_key=subscription_key,
-    )
-    client_verifier = OpenAI(
-    base_url=base_url,
-    api_key=subscription_key)
     prior_knowledge = ""
-    prior_knowledge = ""
+    gene_knowledge = ""
     if knowinte:
         prior_knowledge = "Context Information: "
         prior_knowledge += query_scholar(input_patient_information)
         prior_knowledge += search_google(input_patient_information, num_results=3)
         prior_knowledge += query_pubmed(input_patient_information, max_retries=10)
-        
-    disease_num = "one"
-    if knowdisease or knowdisease != '':
-        meta_prompt = f"You are a helpful biologist and physican. Can you suggest a list of Top {disease_num} possible risk gene for disease {knowdisease}? Please return gene symbols as a comma separated list. Example: 'ABC1, BRAC2, BRAC1' or “not applicable” if you cannot provide the result."
-    else:
-        meta_prompt = f"You are a helpful biologist and physican. Can you suggest a list of Top {disease_num} possible genes to test? Please return gene symbols as a comma separated list. Example: 'ABC1, BRAC2, BRAC1' or “not applicable” if you cannot provide the result."
-    meta_prompt += prior_knowledge
-    response = client.responses.create(
-        model=model,
-        input=meta_prompt + "The input phenotypes are: " + input_patient_information
+    if knowgene != None:
+        prior_knowledge += "Risk Gene Information: The detected risk gene is: " + knowgene +"."
+#     if geneinfo!=None and geneinfo!='nan':
+#         prior_knowledge += "The function of this gene is: "+geneinfo
+
+    # ── Initial diagnosis ──────────────────────────────────────────────────────
+    diagnosis_prompt = _make_diagnosis_prompt(
+        input_patient_information=input_patient_information,
+        prior_knowledge=prior_knowledge,
+        disease_num=disease_num,
     )
-    modelout = response.output_text
-    
-    verifier_prompt = '''You are a helpful biologist and physican and can search resources, tasked with extract and parse the task output based on the history of an agent. Review the entire history of messages provided. Here is the task output requirement: \n Please verify the gene result for testing based on the input message. The ranking process and conclusion is OUTPUT. You should output one word. YES or NO. YES means the diagnosis is correct, and NO means the diagnosis is wrong. Your output: '''
-    for _ in range(epoch):
-        print(f"starting self-verification: epoch {_}")
-        response = client_verifier.responses.create(
-            model=model,
-            input=verifier_prompt.format(OUTPUT=modelout)
+    modelout = _call_claude(client, model, diagnosis_prompt)
+
+    # ── Self-verification loop ─────────────────────────────────────────────────
+    for round_idx in range(max_verify_rounds):
+        print(f"  [verify {round_idx + 1}/{max_verify_rounds}]", end=" ", flush=True)
+
+        solution_text = _extract_tag(modelout, "solution") or modelout
+
+        verifier_prompt = _make_verifier_prompt(
+            prior_knowledge=prior_knowledge,
+            input_patient_information=input_patient_information,
+            diagnosis_text=solution_text,
         )
-        modelout_verifier = response.output_text
-        if "YES" in modelout_verifier:
+        try:
+            verifier_out = _call_claude(client, verifier_model, verifier_prompt, max_tokens=1024)
+            verdict = _normalize_yes_no(verifier_out)
+            feedback = _extract_tag(verifier_out, "feedback") or ""
+        except Exception as e:
+            print(f"verification error: {e}")
+            verdict = "NO"
+            feedback = ""
+
+        if verdict == "YES":
+            print("accepted.")
             break
-        else:
-            response = client.responses.create(
-                model=model,
-                input=meta_prompt + f"The previous gene prioritization process :{modelout}, is wrong. Generate new genes again with thinking and searching." + input_patient_information
-            )
-            modelout = response.output_text
-    
+
+        print("rejected. Retrying with feedback.")
+        fallback_feedback = (
+            "The diagnosis needs reconsideration. "
+            "Please re-examine the phenotypes more carefully and consider alternative rare diseases."
+        )
+        retry_prompt = _make_retry_prompt(
+            input_patient_information=input_patient_information,
+            prior_knowledge=prior_knowledge,
+            previous_diagnosis=solution_text,
+            verifier_feedback=feedback if feedback else fallback_feedback,
+            disease_num=disease_num,
+        )
+        modelout = _call_claude(client, model, retry_prompt)
+
     return modelout
 
+
+def _safe_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def _extract_tag(text: str, tag: str) -> str:
+    """Extract content inside XML-like tags, e.g. <solution>...</solution>."""
+    if not text:
+        return ""
+    pattern = rf"<{tag}>\s*(.*?)\s*</{tag}>"
+    match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _normalize_yes_no(text: str) -> str:
+    answer = _extract_tag(text, "solution") or _extract_tag(text, "answer") or text
+    answer = answer.upper()
+    if "YES" in answer:
+        return "YES"
+    return "NO"
+
+
+def _extract_gene_list(text: str) -> str:
+    """
+    Try to extract the gene list from <solution> or <answer>.
+    Falls back to raw text.
+    """
+    out = _extract_tag(text, "solution") or _extract_tag(text, "answer") or text
+    return out.strip()
+
+
+def _make_gene_prioritization_prompt(
+    input_patient_information: str,
+    prior_knowledge: str = "",
+    gene_num: str = "10",
+    knowdisease: Optional[str] = None,
+) -> str:
+    context_section = (
+        f"\n\n## Supporting Literature / Context\n{prior_knowledge}"
+        if _safe_str(prior_knowledge)
+        else ""
+    )
+
+    if _safe_str(knowdisease):
+        task_line = (
+            f"Identify the top {gene_num} most likely causal / high-priority genes "
+            f"for the disease context: {knowdisease}."
+        )
+    else:
+        task_line = (
+            f"Identify the top {gene_num} most likely causal / high-priority genes "
+            f"to test based on the phenotype profile."
+        )
+
+    return f"""You are an expert clinical geneticist, molecular biologist, and rare disease gene prioritization specialist.
+
+## Patient Phenotypes / Clinical Information
+{input_patient_information}
+{context_section}
+
+## Task
+{task_line}
+
+Use this structured approach:
+1. **Phenotype synthesis** – summarize the most informative phenotypes and organ systems.
+2. **Disease mechanism inference** – infer likely inheritance pattern, pathway, tissue relevance, age of onset, and syndrome class.
+3. **Gene prioritization** – rank candidate genes by how well they explain the phenotype constellation.
+4. **Evidence review** – for each top gene, briefly note supporting evidence and key phenotype matches.
+5. **Final ranking** – provide the most plausible gene list in ranked order.
+
+Requirements:
+- Use official HGNC gene symbols only.
+- Prefer specific causal genes over broad pathway descriptions.
+- Rank genes from most likely to least likely.
+- Do not output disease names in the final answer unless needed briefly in reasoning.
+
+Return:
+- Full reasoning inside <thinking></thinking>
+- Final ranked gene list inside <solution></solution>, one gene symbol per line, no numbering, no bullets
+"""
+
+
+def _make_gene_verifier_prompt(
+    input_patient_information: str,
+    gene_output_text: str,
+    prior_knowledge: str = "",
+    knowdisease: Optional[str] = None,
+) -> str:
+    context_section = (
+        f"\n## Supporting Literature / Context\n{prior_knowledge}"
+        if _safe_str(prior_knowledge)
+        else ""
+    )
+
+    disease_section = (
+        f"\n## Known Disease Context\n{knowdisease}" if _safe_str(knowdisease) else ""
+    )
+
+    return f"""You are an expert clinical geneticist critically reviewing a ranked gene prioritization result.
+
+## Patient Phenotypes / Clinical Information
+{input_patient_information}
+{disease_section}
+{context_section}
+
+## Gene Ranking Under Review
+{gene_output_text}
+
+## Evaluation Criteria
+1. Do the proposed genes explain the phenotype profile well?
+2. Are the genes biologically and clinically plausible?
+3. Are there more likely genes missing from the ranking?
+4. Are the gene symbols valid HGNC-style symbols?
+5. Is the ranking reasonably ordered from strongest to weaker candidates?
+
+Return:
+- Critical reasoning inside <thinking></thinking>
+- If the ranking is acceptable: output YES inside <solution></solution>
+- If the ranking needs improvement: output NO inside <solution></solution>
+- If NO, also provide 1-10 better replacement or missing genes inside <feedback></feedback>, one gene per line, with short rationale if useful
+"""
+
+
+def _make_gene_retry_prompt(
+    input_patient_information: str,
+    previous_output: str,
+    verifier_feedback: str,
+    prior_knowledge: str = "",
+    gene_num: str = "10",
+    knowdisease: Optional[str] = None,
+) -> str:
+    context_section = (
+        f"\n\n## Supporting Literature / Context\n{prior_knowledge}"
+        if _safe_str(prior_knowledge)
+        else ""
+    )
+
+    disease_section = (
+        f"\n## Known Disease Context\n{knowdisease}" if _safe_str(knowdisease) else ""
+    )
+
+    return f"""You are an expert clinical geneticist and gene prioritization specialist. Your previous ranked gene list was reviewed and needs revision.
+
+## Patient Phenotypes / Clinical Information
+{input_patient_information}
+{disease_section}
+{context_section}
+
+## Previous Gene Ranking (rejected)
+{previous_output}
+
+## Reviewer Feedback
+{verifier_feedback}
+
+## Instructions
+Revise the gene prioritization using the reviewer feedback.
+Focus especially on:
+- phenotype features not well explained by the previous ranking
+- missing genes suggested by the reviewer
+- better biological fit, inheritance consistency, and syndrome specificity
+- correct HGNC gene symbols
+
+Return:
+- Revised reasoning inside <thinking></thinking>
+- Revised top {gene_num} ranked genes inside <solution></solution>, one gene symbol per line, no numbering, no bullets
+"""
+
+
+# ─────────────────────────────────────────────
+# Core caller
+# ─────────────────────────────────────────────
+
+def _call_model(
+    client,
+    model_name: str,
+    prompt: str,
+    max_output_tokens: int = 4096,
+) -> str:
+    response = client.responses.create(
+        model=model_name,
+        input=prompt,
+    )
+    return response.output_text
+
+
+
+def run_generank(
+    input_patient_information: str,
+    knowinte: bool = True,
+    knowdisease: Optional[str] = None,
+    gene_num: str = "10",
+    model: str = "gpt-5.4-mini",
+    verifier_model: str = "gpt-5.4-mini",
+    max_verify_rounds: int = 5,
+    sleep_sec: float = 0.0,
+) -> Tuple[str, str]:
+    """
+    Gene prioritization with iterative self-verification.
+
+    Parameters
+    ----------
+    input_patient_information : str
+        Phenotype / patient description.
+    knowinte : bool
+        Whether to retrieve supporting context from external sources.
+    knowdisease : Optional[str]
+        Known disease label, if any.
+    gene_num : str
+        Number of genes to rank, e.g. "10".
+    model : str
+        Main model name.
+    verifier_model : str
+        Verifier model name.
+    max_verify_rounds : int
+        Number of self-verification rounds.
+    sleep_sec : float
+        Optional sleep between retries.
+
+    Returns
+    -------
+    (model_output, prior_knowledge)
+    """
+    if not _safe_str(input_patient_information):
+        raise ValueError("input_patient_information must be a non-empty string.")
+
+    client = OpenAI(
+        base_url=AZURE_BASE_URL,
+        api_key=AZURE_API_KEY
+    )
+
+    # ── Retrieve prior knowledge ──────────────────────────────────────────────
+    prior_knowledge = ""
+    if knowinte:
+        query_text = _safe_str(input_patient_information)
+        if _safe_str(knowdisease):
+            query_text = f"{knowdisease}\n{query_text}"
+
+        knowledge_parts = []
+        try:
+            scholar_text = query_scholar(query_text)
+            if _safe_str(scholar_text):
+                knowledge_parts.append("Scholar:\n" + scholar_text)
+        except Exception as e:
+            print(f"query_scholar error: {e}")
+
+        try:
+            google_text = search_google(query_text, num_results=3)
+            if _safe_str(google_text):
+                knowledge_parts.append("Google:\n" + google_text)
+        except Exception as e:
+            print(f"search_google error: {e}")
+
+        try:
+            pubmed_text = query_pubmed(query_text, max_retries=10)
+            if _safe_str(pubmed_text):
+                knowledge_parts.append("PubMed:\n" + pubmed_text)
+        except Exception as e:
+            print(f"query_pubmed error: {e}")
+
+        prior_knowledge = "\n\n".join(knowledge_parts).strip()
+
+    # ── Initial gene prioritization ───────────────────────────────────────────
+    gene_prompt = _make_gene_prioritization_prompt(
+        input_patient_information=input_patient_information,
+        prior_knowledge=prior_knowledge,
+        gene_num=gene_num,
+        knowdisease=knowdisease,
+    )
+    modelout = _call_model(client, model, gene_prompt)
+
+    # ── Self-verification loop ────────────────────────────────────────────────
+    for round_idx in range(max_verify_rounds):
+        print(f"  [verify {round_idx + 1}/{max_verify_rounds}]", end=" ", flush=True)
+
+        solution_text = _extract_gene_list(modelout)
+
+        verifier_prompt = _make_gene_verifier_prompt(
+            input_patient_information=input_patient_information,
+            gene_output_text=solution_text,
+            prior_knowledge=prior_knowledge,
+            knowdisease=knowdisease,
+        )
+
+        try:
+            verifier_out = _call_model(client, verifier_model, verifier_prompt, max_output_tokens=1024)
+            verdict = _normalize_yes_no(verifier_out)
+            feedback = _extract_tag(verifier_out, "feedback") or ""
+        except Exception as e:
+            print(f"verification error: {e}")
+            verdict = "NO"
+            feedback = ""
+
+        if verdict == "YES":
+            print("accepted.")
+            break
+
+        print("rejected. Retrying with feedback.")
+
+        fallback_feedback = (
+            "The previous gene ranking is not sufficiently supported. "
+            "Please reconsider phenotype fit, inheritance, pathway relevance, and missing high-priority genes."
+        )
+
+        retry_prompt = _make_gene_retry_prompt(
+            input_patient_information=input_patient_information,
+            previous_output=solution_text,
+            verifier_feedback=feedback if feedback else fallback_feedback,
+            prior_knowledge=prior_knowledge,
+            gene_num=gene_num,
+            knowdisease=knowdisease,
+        )
+        modelout = _call_model(client, model, retry_prompt)
+
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+
+    return modelout
 
 def fetch_supplementary_info_from_doi(doi: str, output_dir: str = "supplementary_info"):
     """Fetches supplementary information for a paper given its DOI and returns a research log.
@@ -572,3 +982,4 @@ def extract_pdf_content(url: str) -> str:
         return f"Error downloading PDF: {str(e)}"
     except Exception as e:
         return f"Error extracting text from PDF: {str(e)}"
+

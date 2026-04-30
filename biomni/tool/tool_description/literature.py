@@ -161,7 +161,48 @@ description = [
     {
         "description": "This is a function for disease diagnosis and all quires related to disease diagnosis should follow this function. Making diagnosis for disease and genetic disorder based on the input patient information, including phenotypes, gene (optional), and other modalities for common and rare disease diagnosis.",
         "name": "run_diagnosis",
-        "optional_parameters": [],
+        "optional_parameters": [            {
+                "default": True,
+                "description": "Whether we want to integrate external knowledge in the decision process.",
+                "name": "knowinte",
+                "type": "str",
+            },
+                    {
+                "default": None,
+                "description": "Whether we know the genes recommended for testing or not.",
+                "name": "knowgene",
+                "type": "str",
+            },
+                    {
+                "default": None,
+                "description": "Whether we know the functional information of this gene or not.",
+                "name": "geneinfo",
+                "type": "str",
+            },
+                    {
+                "default": "one",
+                "description": "Number of returned disease.",
+                "name": "disease_num",
+                "type": "str",
+            },
+                            {
+                "default": "gpt-5.4-mini",
+                "description": "Large Language Model used for generating disease diagnosis result.",
+                "name": "model",
+                "type": "str",
+            },
+                            {
+                "default": "gpt-5.4-mini",
+                "description": "Large Language Model used for generating verification result.",
+                "name": "verifier_model",
+                "type": "str",
+            },
+                            {
+                "default": 3,
+                "description": "Maximal iteration time for verification loop",
+                "name": "max_verify_rounds",
+                "type": "int",
+            }],
         "required_parameters": [
             {
                 "default": None,
@@ -176,15 +217,45 @@ description = [
         "name": "run_generank",
         "optional_parameters": [            {
                 "default": True,
-                "description": "Whether we need to integrate information from network searching or not.",
+                "description": "Whether we want to integrate external knowledge in the decision process.",
                 "name": "knowinte",
                 "type": "str",
             },
                     {
                 "default": None,
-                "description": "Diagnosis result for the given patient",
+                "description": "Whether we know the disease or risk information of this patient.",
                 "name": "knowdisease",
                 "type": "str",
+            },
+                    {
+                "default": "one",
+                "description": "Number of returned gebes.",
+                "name": "gene_num",
+                "type": "str",
+            },
+                            {
+                "default": "gpt-5.4-mini",
+                "description": "Large Language Model used for generating disease diagnosis result.",
+                "name": "model",
+                "type": "str",
+            },
+                            {
+                "default": "gpt-5.4-mini",
+                "description": "Large Language Model used for generating verification result.",
+                "name": "verifier_model",
+                "type": "str",
+            },
+                            {
+                "default": 0.0,
+                "description": "Pause time for verification loop",
+                "name": "sleep_sec",
+                "type": "float",
+            },                            
+            {
+                "default": 3,
+                "description": "Maximal iteration time for verification loop",
+                "name": "max_verify_rounds",
+                "type": "int",
             }],
         "required_parameters": [
             {
